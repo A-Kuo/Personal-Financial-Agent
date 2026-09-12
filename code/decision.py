@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 import pandas as pd
@@ -58,6 +59,14 @@ def _valid_installment_option(option: pd.Series, profile: pd.Series) -> bool:
         return False
     duration_months = int(option["number_of_payments"]) * int(option["payment_frequency_days"]) / 30
     return duration_months <= float(maximum) + 1e-9
+
+
+def _option_sort_number(payment_option_id: object) -> float:
+    """Extract the numeric suffix for a correct numeric (not lexicographic)
+    comparison of payment_option_id -- "payment_option_10" must sort after
+    "payment_option_9", which plain string comparison gets wrong."""
+    match = re.search(r"(\d+)$", str(payment_option_id))
+    return float(match.group(1)) if match else float("inf")
 
 
 def _flexible_candidates(profile: pd.Series, user_events: pd.DataFrame) -> list[dict]:
@@ -122,6 +131,120 @@ def _render_changes(changes: list[dict]) -> str:
     return "|".join(rendered)
 
 
+@dataclass(frozen=True)
+class Candidate:
+    """One eligible, already-verified-safe immediate plan. `wait` is not a
+    Candidate -- it's a separate fallback evaluated only when no Candidate
+    exists at all, per problem_statement.md's eligibility rules."""
+
+    method: str  # "full_payment" | "installments" | "partial_payment"
+    schedule: list[tuple[pd.Timestamp, float]]
+    spending_changes: list[dict] = field(default_factory=list)
+    total_paid: float = 0.0
+    option_number: float = float("inf")
+    payment_option_id: str = ""
+    explanation: str = ""
+
+    def rank_key(self, desired_date: pd.Timestamp) -> tuple:
+        # Exactly the 6 criteria in problem_statement.md's "Choosing Between
+        # Safe Plans", in order -- lower tuples win.
+        completes_by_deadline = self.schedule[-1][0] <= desired_date
+        return (
+            0 if completes_by_deadline else 1,  # 1. complete by desired_completion_date
+            len(self.spending_changes),  # 2. require no spending changes
+            round(self.total_paid, 6),  # 3. minimize the total amount paid
+            self.schedule[0][0],  # 4. start payment earlier
+            len(self.schedule),  # 5. use fewer payments
+            self.option_number,  # 6. lowest payment_option_id as final tie-breaker
+        )
+
+
+def _build_candidates(
+    request: pd.Series,
+    profile: pd.Series,
+    user_events: pd.DataFrame,
+    options: pd.DataFrame,
+    request_date: pd.Timestamp,
+    desired_date: pd.Timestamp,
+    horizon_end: pd.Timestamp,
+    requested_amount: float,
+    amount_safe_to_pay: float,
+    full_payment_eligible: bool,
+    prefs: dict[str, set[str]],
+    currency: str,
+    minimum: float,
+) -> list[Candidate]:
+    candidates: list[Candidate] = []
+
+    if full_payment_eligible:
+        full_schedule = [(request_date, requested_amount)]
+        full_forecast = build_forecast(profile, user_events, request_date, horizon_end, payment_schedule=full_schedule)
+        if (full_forecast["safe_balance"] >= -1e-6).all():
+            candidates.append(Candidate(
+                "full_payment", full_schedule, [], requested_amount, explanation=(
+                    f"Pay {currency} {_fmt_amount(requested_amount)} today. This keeps the "
+                    f"{currency} {_fmt_amount(minimum)} minimum protected over the next 90 days."
+                ),
+            ))
+        else:
+            changes = _find_changes_for_full_payment(profile, user_events, request_date, horizon_end, requested_amount)
+            if changes:
+                changed_forecast = build_forecast(
+                    profile, user_events, request_date, horizon_end,
+                    spending_changes=changes, payment_schedule=full_schedule,
+                )
+                if (changed_forecast["safe_balance"] >= -1e-6).all():
+                    first = changes[0]
+                    action = first["action"].replace("_", " ").capitalize()
+                    candidates.append(Candidate(
+                        "full_payment", full_schedule, changes, requested_amount, explanation=(
+                            f"{action} {first['description']}, then pay {currency} {_fmt_amount(requested_amount)} "
+                            f"today. This keeps the {currency} {_fmt_amount(minimum)} minimum protected."
+                        ),
+                    ))
+
+    installments = options[(options["request_id"] == request["request_id"]) & (options["payment_method"] == "installments")].copy()
+    if not installments.empty:
+        installments = installments[installments.apply(_valid_installment_option, axis=1, profile=profile)]
+        for _, option in installments.iterrows():
+            schedule = _installment_schedule(option)
+            forecast = build_forecast(profile, user_events, request_date, horizon_end, payment_schedule=schedule)
+            if (forecast["safe_balance"] >= -1e-6).all():
+                first_payment = schedule[0][1]
+                candidates.append(Candidate(
+                    "installments", schedule, [],
+                    total_paid=float(option["total_payable_amount"]),
+                    option_number=_option_sort_number(option["payment_option_id"]),
+                    payment_option_id=str(option["payment_option_id"]),
+                    explanation=(
+                        f"Use {int(option['number_of_payments'])} installments of {currency} {_fmt_amount(first_payment)}, "
+                        f"starting {_fmt_date(schedule[0][0])}. This keeps the {currency} {_fmt_amount(minimum)} minimum protected."
+                    ),
+                ))
+
+    if bool(request["allows_partial_payment"]) and "partial_payment" in prefs["methods"] and 0 < amount_safe_to_pay < requested_amount:
+        first_payment = amount_safe_to_pay
+        remainder = requested_amount - first_payment
+        baseline_dates = build_forecast(profile, user_events, request_date, horizon_end)
+        for _, row in baseline_dates.iterrows():
+            date = pd.Timestamp(row["date"])
+            if not request_date < date <= desired_date:
+                continue
+            schedule = [(request_date, first_payment), (date, remainder)]
+            forecast = build_forecast(profile, user_events, request_date, horizon_end, payment_schedule=schedule)
+            if (forecast["safe_balance"] >= -1e-6).all():
+                candidates.append(Candidate(
+                    "partial_payment", schedule, [], requested_amount, explanation=(
+                        f"Pay {currency} {_fmt_amount(first_payment)} today and the remaining {currency} "
+                        f"{_fmt_amount(remainder)} on {_fmt_date(date)}. This completes the full request and "
+                        f"keeps the {currency} {_fmt_amount(minimum)} minimum protected."
+                    ),
+                ))
+                break  # earliest safe remainder date; all other criteria tie among partial's own options
+
+    return candidates
+
+
 def make_decision(request: pd.Series, profile: pd.Series, user_events: pd.DataFrame, options: pd.DataFrame) -> Decision:
     request_date = pd.Timestamp(request["request_date"]).normalize()
     desired_date = pd.Timestamp(request["desired_completion_date"]).normalize()
@@ -138,70 +261,40 @@ def make_decision(request: pd.Series, profile: pd.Series, user_events: pd.DataFr
     # by the LOWEST safe_balance anywhere in the forecast, not just today's --
     # paying X today reduces every later day's running balance by the same X, so
     # a future dip smaller than today's headroom caps what's actually safe now.
-    # (baseline.iloc[0] alone under-constrains this: request_79 in the sample
-    # dataset has 1104 safe today but only 791 at its day-9 low, and using the
-    # day-0 figure let a partial-payment first installment retroactively break
-    # that later day, which showed up as a false not_affordable/verify failure.)
     safe_today = max(0.0, float(baseline["safe_balance"].min()))
-    # amount_safe_to_pay is defined as capacity "before optional spending changes"
-    # and independent of the chosen method/plan -- confirmed against
+    # amount_safe_to_pay is capacity "before optional spending changes",
+    # independent of the chosen method/plan -- confirmed against
     # sample_requests.csv: request_06 pays its full 620.40 via a spending change
     # but reports amount_safe_to_pay=603.30 (the pre-change baseline), and
     # request_12 reports amount_safe_to_pay == requested_amount while still being
     # recommended installments (the user's accepted methods just exclude
-    # full_payment). So this single baseline figure is used in every branch below,
-    # never a plan-specific number like an installment's per-payment amount.
+    # full_payment). One baseline figure, used regardless of which plan wins.
     amount_safe_to_pay = min(safe_today, requested_amount)
     # Capacity to pay the full amount as a single payment, independent of which
-    # method the user actually accepts -- see problem_statement.md's note that
-    # this field "may equal request_date even when the selected recommendation
-    # is installments because the user has chosen not to consider full payment."
+    # method the user actually accepts -- problem_statement.md notes this field
+    # "may equal request_date even when the selected recommendation is
+    # installments because the user has chosen not to consider full payment."
     capacity_earliest = earliest_full_payment_date(baseline, requested_amount)
-    full_schedule = [(request_date, requested_amount)]
-    full_forecast = build_forecast(profile, user_events, request_date, horizon_end, payment_schedule=full_schedule)
 
-    if full_payment_eligible and (full_forecast["safe_balance"] >= -1e-6).all():
-        return Decision(request["request_id"], amount_safe_to_pay, "affordable_now", "full_payment", _render_schedule(full_schedule), _fmt_date(request_date), "none", f"Pay {currency} {_fmt_amount(requested_amount)} today. This keeps the {currency} {_fmt_amount(minimum)} minimum protected over the next 90 days.")
+    candidates = _build_candidates(
+        request, profile, user_events, options, request_date, desired_date, horizon_end,
+        requested_amount, amount_safe_to_pay, full_payment_eligible, prefs, currency, minimum,
+    )
 
-    changes = _find_changes_for_full_payment(profile, user_events, request_date, horizon_end, requested_amount) if full_payment_eligible else None
-    if changes:
-        changed_forecast = build_forecast(profile, user_events, request_date, horizon_end, spending_changes=changes, payment_schedule=full_schedule)
-        if (changed_forecast["safe_balance"] >= -1e-6).all():
-            first = changes[0]
-            action = first["action"].replace("_", " ").capitalize()
-            return Decision(request["request_id"], amount_safe_to_pay, "affordable_with_plan", "full_payment", _render_schedule(full_schedule), _fmt_date(request_date), _render_changes(changes), f"{action} {first['description']}, then pay {currency} {_fmt_amount(requested_amount)} today. This keeps the {currency} {_fmt_amount(minimum)} minimum protected.")
-
-    installments = options[(options["request_id"] == request["request_id"]) & (options["payment_method"] == "installments")].copy()
-    if not installments.empty:
-        installments = installments[installments.apply(_valid_installment_option, axis=1, profile=profile)].sort_values(
-            ["total_payable_amount", "first_payment_date", "number_of_payments", "payment_option_id"]
+    if candidates:
+        winner = min(candidates, key=lambda candidate: candidate.rank_key(desired_date))
+        is_plain_full_payment_today = winner.method == "full_payment" and not winner.spending_changes
+        status = "affordable_now" if is_plain_full_payment_today else "affordable_with_plan"
+        earliest_text = {
+            "full_payment": _fmt_date(request_date),
+            "partial_payment": _fmt_date(winner.schedule[-1][0]),
+            "installments": _fmt_date(capacity_earliest) if capacity_earliest is not None else "",
+        }[winner.method]
+        return Decision(
+            request["request_id"], amount_safe_to_pay, status, winner.method,
+            _render_schedule(winner.schedule), earliest_text,
+            _render_changes(winner.spending_changes), winner.explanation,
         )
-        for _, option in installments.iterrows():
-            schedule = _installment_schedule(option)
-            # Criterion 1 (complete by desired_completion_date) applies to
-            # installments the same way it already does to partial_payment below --
-            # horizon_end extends to a 90-day safety window that can run well past
-            # the user's actual deadline, so checking against it instead of
-            # desired_date let plans that miss the deadline slip through.
-            if schedule[-1][0] > desired_date:
-                continue
-            forecast = build_forecast(profile, user_events, request_date, horizon_end, payment_schedule=schedule)
-            if (forecast["safe_balance"] >= -1e-6).all():
-                first_payment = schedule[0][1]
-                earliest_full_text = _fmt_date(capacity_earliest) if capacity_earliest is not None else ""
-                return Decision(request["request_id"], amount_safe_to_pay, "affordable_with_plan", "installments", _render_schedule(schedule), earliest_full_text, "none", f"Use {int(option['number_of_payments'])} installments of {currency} {_fmt_amount(first_payment)}, starting {_fmt_date(schedule[0][0])}. This keeps the {currency} {_fmt_amount(minimum)} minimum protected.")
-
-    if bool(request["allows_partial_payment"]) and "partial_payment" in prefs["methods"] and 0 < amount_safe_to_pay < requested_amount:
-        first_payment = amount_safe_to_pay
-        remainder = requested_amount - first_payment
-        for _, row in baseline.iterrows():
-            date = pd.Timestamp(row["date"])
-            if not request_date < date <= desired_date:
-                continue
-            schedule = [(request_date, first_payment), (date, remainder)]
-            forecast = build_forecast(profile, user_events, request_date, horizon_end, payment_schedule=schedule)
-            if (forecast["safe_balance"] >= -1e-6).all():
-                return Decision(request["request_id"], first_payment, "affordable_with_plan", "partial_payment", _render_schedule(schedule), _fmt_date(date), "none", f"Pay {currency} {_fmt_amount(first_payment)} today and the remaining {currency} {_fmt_amount(remainder)} on {_fmt_date(date)}. This completes the full request and keeps the {currency} {_fmt_amount(minimum)} minimum protected.")
 
     if full_payment_eligible and capacity_earliest is not None:
         return Decision(request["request_id"], amount_safe_to_pay, "affordable_later", "wait", _render_schedule([(capacity_earliest, requested_amount)]), _fmt_date(capacity_earliest), "none", f"Pay {currency} {_fmt_amount(requested_amount)} in full on {_fmt_date(capacity_earliest)}. Paying earlier would put the {currency} {_fmt_amount(minimum)} minimum at risk.")
