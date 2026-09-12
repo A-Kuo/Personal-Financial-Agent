@@ -10,11 +10,13 @@ CASH_EVENT_TYPES = {
     "expense",
     "income",
     "subscription",
-    "debtpayment",
-    "investmentpurchase",
+    "debt_payment",
+    "investment_purchase",
+    "investment_sale",
     "refund",
 }
-EXCLUDED_EVENT_TYPES = {"investmentvaluation"}
+EXCLUDED_EVENT_TYPES = {"investment_valuation"}
+EXCLUDED_STATUSES = {"cancelled", "failed"}
 UNCONFIRMED_MESSAGE_TYPES = {
     "unconfirmed_income",
     "refund_pending",
@@ -141,7 +143,7 @@ def _add_image_amounts(
 def _remove_non_cash(events: pd.DataFrame) -> pd.DataFrame:
     return events[
         ~events["event_type"].isin(EXCLUDED_EVENT_TYPES)
-        & (events["direction"] != "noncash")
+        & (events["direction"] != "non_cash")
         & events["event_type"].isin(CASH_EVENT_TYPES)
     ].copy()
 
@@ -181,6 +183,11 @@ def normalize_events(
     normalized = _add_image_amounts(events, image_results, profiles, exchange_rates)
     normalized = _remove_non_cash(normalized)
     normalized = _apply_message_policy(normalized, message_results)
+    # Cancelled/failed transactions never happened as cash events, per the 90-day
+    # safety check's explicit rule -- unless a message reinstated a specific one
+    # (e.g. "failed_debit" above flips status to scheduled because the bill is
+    # still due), which is why this runs after _apply_message_policy, not before.
+    normalized = normalized[~normalized["status"].isin(EXCLUDED_STATUSES)].copy()
     normalized["cash_date"] = normalized["settlement_date"].fillna(normalized["event_date"])
     normalized["amount"] = pd.to_numeric(normalized["amount"], errors="coerce")
     normalized = normalized[normalized["amount"].notna()].copy()

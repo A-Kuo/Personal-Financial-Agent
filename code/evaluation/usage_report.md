@@ -6,19 +6,19 @@ This report corresponds to the final pipeline run that generated `output.csv`.
 
 - Requests processed: 250
 - Model calls: 19
-- Input tokens: 884
-- Output tokens: 295
-- OCR pages processed: 16
-- Estimated total cost: $0.064118
-- Average tokens per request: 4.72
-- Average cost per request: $0.000256
+- Input tokens: 0
+- Output tokens: 0
+- OCR pages processed: 0
+- Estimated total cost: $0.000000
+- Average tokens per request: 0.00
+- Average cost per request: $0.000000
 
 ## Usage by Model
 
 | Provider | Model | Operation | Calls | Cached calls | Input tokens | Output tokens | OCR pages | Estimated cost (USD) |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| mistral | ministral-3b-latest | message_extraction | 3 | 0 | 884 | 295 | 0 | $0.000118 |
-| mistral | mistral-ocr-latest | image_ocr | 16 | 0 | 0 | 0 | 16 | $0.064000 |
+| mistral | ministral-3b-latest | message_extraction | 3 | 3 | 0 | 0 | 0 | $0.000000 |
+| mistral | mistral-ocr-latest | image_ocr | 16 | 16 | 0 | 0 | 0 | $0.000000 |
 
 ## Pricing Assumptions
 

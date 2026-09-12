@@ -24,32 +24,60 @@ def _infer_frequency_days(group: pd.DataFrame) -> int | None:
     return None
 
 
+def _project_group(group: pd.DataFrame, horizon_end: pd.Timestamp, use_latest_amount: bool) -> list[dict]:
+    frequency = _infer_frequency_days(group)
+    if frequency is None:
+        return []
+    latest = group.sort_values("cash_date").iloc[-1]
+    if use_latest_amount:
+        # Conservative for income: project forward at the most recently confirmed
+        # rate rather than blending in a one-off prorated-first-payment or bonus
+        # that isn't representative of the ongoing recurring amount.
+        typical_amount = float(latest["amount"])
+    else:
+        typical_amount = float(group["amount"].tail(min(4, len(group))).median())
+    rows: list[dict] = []
+    next_date = pd.Timestamp(latest["cash_date"]) + timedelta(days=frequency)
+    while next_date <= horizon_end:
+        projected = latest.to_dict()
+        projected["event_id"] = f"projected::{latest['event_id']}::{next_date.date()}"
+        projected["cash_date"] = next_date
+        projected["amount"] = typical_amount
+        projected["signed_amount"] = typical_amount if projected["direction"] == "credit" else -typical_amount
+        projected["status"] = "projected"
+        projected["projected"] = True
+        rows.append(projected)
+        next_date += timedelta(days=frequency)
+    return rows
+
+
 def _project_recurring_events(
     history: pd.DataFrame,
     request_date: pd.Timestamp,
     horizon_end: pd.Timestamp,
 ) -> pd.DataFrame:
-    past = history[history["cash_date"] <= request_date].copy()
+    # Known real data points -- historical AND already-confirmed/scheduled future
+    # ones -- both inform the cadence and anchor where projection should resume.
+    # Using only cash_date <= request_date (as before) excludes an already-known
+    # "next confirmed salary" from ever being recognized, which either starves
+    # income projection entirely (sparse-history users) or, when income history
+    # IS rich enough to self-detect a cadence under a different description (e.g.
+    # "Payroll credit" vs "Next confirmed salary" for the same job), lets the
+    # projector fabricate a duplicate payday right next to the real confirmed one.
+    known = history[history["cash_date"] <= horizon_end].copy()
     rows: list[dict] = []
-    group_cols = ["user_id", "event_type", "description", "category", "direction", "currency"]
 
-    for _, group in past.groupby(group_cols, dropna=False):
-        frequency = _infer_frequency_days(group)
-        if frequency is None:
-            continue
-        latest = group.sort_values("cash_date").iloc[-1]
-        typical_amount = float(group["amount"].tail(min(4, len(group))).median())
-        next_date = pd.Timestamp(latest["cash_date"]) + timedelta(days=frequency)
-        while next_date <= horizon_end:
-            projected = latest.to_dict()
-            projected["event_id"] = f"projected::{latest['event_id']}::{next_date.date()}"
-            projected["cash_date"] = next_date
-            projected["amount"] = typical_amount
-            projected["signed_amount"] = typical_amount if projected["direction"] == "credit" else -typical_amount
-            projected["status"] = "projected"
-            projected["projected"] = True
-            rows.append(projected)
-            next_date += timedelta(days=frequency)
+    income = known[known["event_type"] == "income"]
+    # Grouped by category rather than description: real payroll data relabels
+    # the next confirmed payment differently from prior "Payroll credit" rows,
+    # so description-based grouping treats them as unrelated series.
+    for _, group in income.groupby(["user_id", "category", "direction", "currency"], dropna=False):
+        rows.extend(_project_group(group, horizon_end, use_latest_amount=True))
+
+    other = known[known["event_type"] != "income"]
+    group_cols = ["user_id", "event_type", "description", "category", "direction", "currency"]
+    for _, group in other.groupby(group_cols, dropna=False):
+        rows.extend(_project_group(group, horizon_end, use_latest_amount=False))
 
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=history.columns)
 
