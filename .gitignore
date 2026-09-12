@@ -1,0 +1,8 @@
+log.txt
+__pycache__/
+*.pyc
+.env
+output.csv
+code.zip
+code/cache/
+code/evaluation/usage_log.jsonl
