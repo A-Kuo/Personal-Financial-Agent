@@ -94,7 +94,14 @@ def build_forecast(
     payment_schedule = payment_schedule or []
 
     events = user_events[user_events["confirmed_by_message"]].copy()
-    future_actual = events[(events["cash_date"] >= request_date) & (events["cash_date"] <= horizon_end)].copy()
+    future_actual = events[
+        (events["cash_date"] >= request_date)
+        & (events["cash_date"] <= horizon_end)
+        # "Do not count pending credits ... until they settle" -- a pending
+        # refund/bonus/commission isn't cash yet even if it's dated within the
+        # forecast window. Pending debits are handled separately (reserved).
+        & ~((events["status"] == "pending") & (events["direction"] == "credit"))
+    ].copy()
     projected = _project_recurring_events(events, request_date, horizon_end)
     all_events = pd.concat([future_actual, projected], ignore_index=True, sort=False)
 

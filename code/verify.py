@@ -45,6 +45,10 @@ def verify_output(
         raise ValueError("output.csv request IDs do not match requests.csv.")
 
     requested = requests.set_index("request_id")["requested_amount"].to_dict()
+    request_dates = {
+        row.request_id: pd.Timestamp(row.request_date).strftime("%Y-%m-%d")
+        for row in requests.itertuples(index=False)
+    }
     valid_installment_plans = {
         (row.request_id, _render_option_plan(pd.Series(row._asdict())))
         for row in payment_options.itertuples(index=False)
@@ -69,17 +73,23 @@ def verify_output(
                 raise ValueError(f"{row.request_id}: partial payment must have exactly two entries.")
             if abs(sum(value for _, value in schedule) - float(requested[row.request_id])) > 0.02:
                 raise ValueError(f"{row.request_id}: partial plan does not sum to the request amount.")
+            if not 0 < amount < float(requested[row.request_id]) - 1e-6:
+                raise ValueError(f"{row.request_id}: partial_payment requires 0 < amount_safe_to_pay < requested_amount.")
 
         changes = str(row.spending_changes_needed)
         if changes != "none":
             entries = changes.split("|")
             if len(entries) > 3:
                 raise ValueError(f"{row.request_id}: more than three spending changes.")
+            seen_event_ids: set[str] = set()
             for entry in entries:
                 parts = entry.split(":")
                 if len(parts) < 2 or parts[0] not in {"stop", "reduce_to"}:
                     raise ValueError(f"{row.request_id}: invalid spending change format.")
                 event_id = parts[1]
+                if event_id in seen_event_ids:
+                    raise ValueError(f"{row.request_id}: stop and reduce_to on the same event {event_id} are mutually exclusive.")
+                seen_event_ids.add(event_id)
                 event_flexibility = str(flexibility.get(event_id, ""))
                 if not event_flexibility or event_flexibility == "fixed":
                     raise ValueError(f"{row.request_id}: change targets fixed/missing event {event_id}.")
@@ -93,3 +103,5 @@ def verify_output(
                 raise ValueError(f"{row.request_id}: not_affordable must have blank earliest date.")
         elif not str(row.earliest_date_for_full_payment).strip():
             raise ValueError(f"{row.request_id}: a feasible outcome requires an earliest payment date.")
+        elif row.affordability_status == "affordable_now" and str(row.earliest_date_for_full_payment).strip() != request_dates[row.request_id]:
+            raise ValueError(f"{row.request_id}: affordable_now requires earliest_date_for_full_payment == request_date.")
