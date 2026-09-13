@@ -1,3 +1,5 @@
+Dupe of README required for submission
+
 # Buy or Wait? — Solution
 
 Deterministic 90-day affordability forecaster with a narrowly-scoped LLM/VLM enrichment
