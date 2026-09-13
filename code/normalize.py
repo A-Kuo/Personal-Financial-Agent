@@ -140,6 +140,37 @@ def _add_image_amounts(
     return events
 
 
+def _convert_to_home_currency(
+    events: pd.DataFrame,
+    profiles: pd.DataFrame,
+    rates: pd.DataFrame,
+) -> pd.DataFrame:
+    """Convert every event's amount into the user's home_currency -- not just
+    the image-derived ones _add_image_amounts already handles. 140 events across
+    27 users are booked in a foreign currency (e.g. "International employer
+    payroll" paid in USD to an IDR-home user); left unconverted, a $1,800 salary
+    was being summed as if it were IDR 1,800 next to a IDR 20M/quarter rent,
+    making that user's income look almost nonexistent."""
+    events = events.copy()
+    currency_by_user = profiles.set_index("user_id")["home_currency"].to_dict()
+    if "source_currency" not in events.columns:
+        events["source_currency"] = events["currency"]
+
+    for index, event in events.iterrows():
+        target = currency_by_user.get(event["user_id"])
+        if target is None or event["currency"] == target or pd.isna(event["amount"]):
+            continue
+        cash_date = event["settlement_date"] if pd.notna(event["settlement_date"]) else event["event_date"]
+        converted = convert_currency(float(event["amount"]), event["currency"], target, pd.Timestamp(cash_date), rates)
+        if converted is None:
+            continue
+        events.loc[index, "source_currency"] = event["currency"]
+        events.loc[index, "amount"] = converted
+        events.loc[index, "currency"] = target
+
+    return events
+
+
 def _remove_non_cash(events: pd.DataFrame) -> pd.DataFrame:
     return events[
         ~events["event_type"].isin(EXCLUDED_EVENT_TYPES)
@@ -181,6 +212,7 @@ def normalize_events(
     message_results: dict[str, MessageExtraction],
 ) -> pd.DataFrame:
     normalized = _add_image_amounts(events, image_results, profiles, exchange_rates)
+    normalized = _convert_to_home_currency(normalized, profiles, exchange_rates)
     normalized = _remove_non_cash(normalized)
     normalized = _apply_message_policy(normalized, message_results)
     # Cancelled/failed transactions never happened as cash events, per the 90-day

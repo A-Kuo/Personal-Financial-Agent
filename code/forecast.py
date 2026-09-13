@@ -8,6 +8,13 @@ import pandas as pd
 
 
 def _infer_frequency_days(group: pd.DataFrame) -> int | None:
+    # A per-diff "majority bucket" approach (treating an isolated outlier gap,
+    # e.g. an unpaid-leave month, as noise rather than letting it corrupt the
+    # cadence) was tried and reverted: on the full 250-request dataset it
+    # increased not_affordable from 74 to 97 by also picking up spurious
+    # "recurring" patterns in small, genuinely irregular expense groups that
+    # the plain median correctly left undetected. The narrow leave-gap case
+    # stays imperfectly handled; that's a smaller loss than the regression.
     dates = sorted(pd.to_datetime(group["cash_date"].dropna()).unique())
     if len(dates) < 2:
         return None
@@ -30,10 +37,22 @@ def _project_group(group: pd.DataFrame, horizon_end: pd.Timestamp, use_latest_am
         return []
     latest = group.sort_values("cash_date").iloc[-1]
     if use_latest_amount:
-        # Conservative for income: project forward at the most recently confirmed
-        # rate rather than blending in a one-off prorated-first-payment or bonus
-        # that isn't representative of the ongoing recurring amount.
-        typical_amount = float(latest["amount"])
+        # Conservative for income: project forward at the ESTABLISHED rate when
+        # one exists (the amount that actually repeats), not a plain average --
+        # a one-off prorated-first-payment or bonus would otherwise pull the
+        # ongoing figure off the real recurring amount. But a repeat majority
+        # can itself be the wrong anchor when the single latest point is a
+        # known one-cycle blip: messages.csv's "reduced due to approved unpaid
+        # leave" pattern explicitly says the adjustment is for the NEXT payslip
+        # only, and the ledger for that pattern shows N months at one rate then
+        # one differing month -- using the majority rate (the established one)
+        # models the expected recovery; a genuine rate change (a raise, a new
+        # job) instead shows no repeated majority, so this falls through to the
+        # latest confirmed point, which is what request_01/user_100 in the
+        # sample dataset need (first-job salary, or a same-amount next payslip).
+        mode = group["amount"].mode()
+        has_majority = len(mode) == 1 and (group["amount"] == mode.iloc[0]).sum() > 1
+        typical_amount = float(mode.iloc[0]) if has_majority else float(latest["amount"])
     else:
         typical_amount = float(group["amount"].tail(min(4, len(group))).median())
     rows: list[dict] = []
