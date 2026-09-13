@@ -1,5 +1,9 @@
 # HackerRank Orchestrate
 
+This is my fork of the Hackerrank Orchestrate - Create a personalized financial spending agent.
+
+All code is within code/ subdirectory.
+
 Starter repository for the **HackerRank Orchestrate** 24-hour hackathon (September 2026).
 
 ## Buy or Wait?
