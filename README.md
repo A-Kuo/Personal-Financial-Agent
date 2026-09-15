@@ -80,6 +80,9 @@ Accepts `--skip-enrichment` too, for the same reason as above.
 
 <img width="943" height="642" alt="image" src="https://github.com/user-attachments/assets/8834ed11-70da-42f1-b6c8-33cce3f36a77" />
 
+<img width="841" height="619" alt="image" src="https://github.com/user-attachments/assets/30b69178-8eb2-4425-9766-b81a4bcc986f" />
+
+
 
 ## Module layout
 
