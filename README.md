@@ -76,6 +76,11 @@ decision *style*, not a proxy for the graded 250 — `problem_statement.md` is e
 that the samples are examples of format, not labels for the evaluation requests.
 Accepts `--skip-enrichment` too, for the same reason as above.
 
+## Demo
+
+<img width="943" height="642" alt="image" src="https://github.com/user-attachments/assets/8834ed11-70da-42f1-b6c8-33cce3f36a77" />
+
+
 ## Module layout
 
 | File | Stage | Calls a model? |
